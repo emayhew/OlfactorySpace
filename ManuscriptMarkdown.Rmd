@@ -1,0 +1,992 @@
+---
+title: "Drawing the Borders of Olfactory Space"
+author: Emily J Mayhew, Charles J Arayata, Richard C. Gerkin, Brian K. Lee, Jonathan Magill, Lindsey L Snyder, Kelsie Little, Chung
+  Wen Yu, Joel D Mainland
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    df_print: paged
+    fig_height: 4.5
+    fig_width: 7
+    highlight: tango
+    number_sections: yes
+    theme: cosmo
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# In this markdown
+
+This markdown trains models, conducts analyses, and generates figures presented in the manuscript Drawing the Borders of Olfactory Space (bioRxiv preprint: https://doi.org/10.1101/2020.12.04.412254).
+
+Complete datasets will be uploaded at a later date.
+
+
+```{r, echo = T}
+#load required packages 
+pacman::p_load(tidyverse, caret, FactoMineR, DMwR, nnet, ROCR, plotly, knitr, RRF, ggmap, cowplot)
+
+```
+
+# Process data
+
+## Read in data tables
+
+These data tables will be made available at a later date.
+
+```{r}
+#read in supplemental data tables
+S1 <- read.csv("tables/S1.csv", stringsAsFactors = F)
+S2 <- read.csv("tables/S2.csv", stringsAsFactors = F)
+S3 <- read.csv("tables/S3.alt.csv", stringsAsFactors = F)
+
+```
+
+
+## Partition data
+
+The dataset was divided into 3 parts: a training set (n=1869), a validation set for model tuning (n=30), and a test set for measuring final model performance (n=30).
+
+```{r}
+#make odor class a factor
+S1 <- S1 %>%
+  mutate(odor.class = factor(odor.class,
+                              levels = c("Odorless", "Odor")))
+
+#split dataset based on assignment in "dataset.assigned" column
+train <- S1 %>% filter(dataset.assigned == "train")
+validation <- S1 %>% filter(dataset.assigned == "validation")
+test <- S1 %>% filter(dataset.assigned == "test") 
+
+```
+
+
+## Pre-process and rebalance training set
+
+```{r, warning=F}
+#select only columns needed for model training
+train <- train %>% select(odor.class, boiling.point.estimate.Banks:Infective.50)
+
+#generate pre-processing procedure to scale (0 to 1), drop variables with near zero variance, drop highly correlated variables
+preProc <- preProcess(train[,-1], method = c("range", "zv", "corr"), na.remove = TRUE, verbose = FALSE, k=5, freqCut = 95/5, uniqueCut = 10, cutoff = 0.99, rangeBounds = c(0, 1))
+
+#apply pre-processing to datasets
+train_scaled <- predict(preProc, train) 
+val_scaled <- predict(preProc, validation)
+test_scaled <- predict(preProc, test)
+ALL_scaled <- predict(preProc, S1)
+
+#apply SMOTE procedure to rebalance odor:odorless examples
+set.seed(123)
+#uses scaled data (for everything model)
+train_smote <- SMOTE(odor.class ~., train_scaled, perc.over = (100 + 50*6), k=5, perc.under = 200)  
+
+```
+
+
+# Train models
+
+```{r}
+# set seeds amd training parameters
+
+#generate list of seeds to use in training models
+set.seed(724)
+train.seeds <- sample(1:999, 10, replace=FALSE)
+
+#set training parameters
+fit.control <- trainControl(
+  method = "repeatedcv", 
+  number = 5, 
+  repeats = 2,
+  savePredictions = T,
+  returnResamp = "all",
+  classProbs = T,
+  summaryFunction = twoClassSummary)
+
+#regularized xgb-linear tuning grid
+xgbTuningGrid = expand.grid(nrounds = c(50, 100), 
+                            lambda = seq(0.1, 0.5, 0.1), 
+                            alpha = seq(0.1, 0.5, 0.1),
+                            eta = c(0.3, 0.4))
+
+```
+
+
+## Train transport ML model
+
+```{r}
+### ML Transport model ###
+
+if (file.exists("xgbL.transport.rds")){
+  xgbL.transport <- readRDS("xgbL.transport.rds")
+}else {
+  
+#subset train dataset to only transport features
+train_transport <- train_smote[,c("odor.class", "boiling.point.best.available", "vapor.pressure.best.available", "MLOGP")]
+
+#train model
+set.seed(train.seeds[6])
+      xgbL.transport <- train(odor.class~., data=train_transport, 
+                         method = "xgbLinear", 
+                         trControl = fit.control,
+                         metric = "ROC", 
+                         tuneGrid = xgbTuningGrid, 
+                         na.action = na.roughfix) 
+saveRDS(xgbL.transport, "xgbL.transport.rds")
+}
+```
+
+
+## Train many-feature ML model
+
+```{r}
+### ML Many Feature model ###
+
+if (file.exists("xgbL.manyfeature.rds")){
+  xgbL.manyfeature <- readRDS("xgbL.manyfeature.rds")
+}else {
+#subset by dropping estimated boiling point values, keep only "best available" boiling point
+train_manyFeature <- train_smote %>% select(odor.class, boiling.point.best.available:Infective.50)
+
+#train model      
+set.seed(train.seeds[6])
+      xgbL.manyfeature <- train(odor.class~., data=train_manyFeature, 
+                         method = "xgbLinear", 
+                         trControl = fit.control,
+                         metric = "ROC", 
+                         tuneGrid = xgbTuningGrid, 
+                         na.action = na.roughfix) 
+saveRDS(xgbL.manyfeature, "xgbL.manyfeature.rds")
+}
+```
+
+
+# Reproduce Figures
+
+## Figure 1
+
+Fig. 1. A machine learning model can accurately classify molecules as odorous or odorless based only on transport features. 
+
+```{r, results='hide'}
+#######################################-
+#Figure 1 Associated Stats ------
+#######################################-
+
+#dataset composition
+table(S1$odor.class) # 1618 odor, 309 odorless
+nrow(S1[S1$odor.class == "Odor",])/nrow(S1) # 84.0% odorous
+nrow(S1[S1$odor.class == "Odorless",])/nrow(S1) # 16.0% odorless
+
+```
+
+
+### Figure 1B
+
+Transport-feature ML model-generated odorous probabilities for all molecules in the dataset. Each dot represents one molecule colored by the ground truth, and the width of the violin plot is the density of molecules at a given prediction value. 
+
+```{r}
+#######################################-
+# Figure 1B: Transport ML Model predictions on full dataset
+#######################################-
+
+#generate predictions for transport model on full dataset 
+prob.transport <- predict(xgbL.transport, newdata = ALL_scaled, type = "prob")[,2]
+
+#combine predictions with true odor class
+predictions <- ALL_scaled %>% 
+  select(odor.class) %>%
+  mutate(p.transport = prob.transport)
+  
+#Make dotplot + violin of model predictions
+ggplot(predictions, aes(odor.class, p.transport, color = odor.class)) +
+  geom_jitter(alpha=0.25) +
+  geom_violin(color = "black", alpha = 0.1, scale = "width")+
+  coord_flip()+
+  theme_classic()+
+  labs(x = "True Odor Classification",
+       y = "Transport ML Model Predicted Odorous Probability")+
+  scale_color_brewer(type = "qual", palette = 6, direction = -1)+
+  theme(axis.text.x = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position="none")
+
+#ggsave("figures/final/Fig1B.png", width = 3.6, height = 2)
+#ggsave("figures/final/Fig1B.pdf", width = 4, height = 1.8)
+```
+
+
+
+### Figure 1C
+
+Model performance on a held-out test set of 30 molecules, quantified by the metric Area Under the Receiver Operating Characteristic (AUROC) curve, for transport-feature and many-feature machine learning models and published fragrance-like (6) and Boelens’ (4) models. 
+
+```{r, results='hide', warning=F}
+#######################################-
+# Figure 1C: Transport ML vs All feature ML and Literature models AUROC ----
+#######################################-
+
+#load function to calculate AUROC SD
+source("code/AUROCSDfn.R")
+
+#print class ratios - needed in calculation of AUROC SE
+table(test$odor.class) #20 odor/10 odorless
+
+
+##### Boelens performance on test set ----
+
+#set default to Odorless
+test$boelens.odor <- 1 #"Odorless"
+#generate MLOGP limits based on BP & Boelens curve
+test$BP2 <- test$boiling.point.best.available^2
+test$boelens.num <- ((0.00011243*test$BP2) - (0.022976*test$boiling.point.best.available) - 0.00016245)
+#assign class "Odor" if MLOGP value is above Boelens curve
+test[test$boelens.num < test$MLOGP, "boelens.odor"] <- 0 #"Odor"
+
+#compare Boelens odor class prediction to true class
+test.boelens.pred <- prediction(test$boelens.odor, test$odor.class)
+#calculate auroc
+test.boelens.perf <- performance(test.boelens.pred, "auc") 
+#print auroc
+test.boelens.perf@y.values[[1]] #AUROC = 0.80
+
+#change to factor for confusionMatrix calculation
+test$boelens.odor <- ifelse(test$boelens.odor==1, "Odorless", "Odor")
+test$boelens.odor <- factor(test$boelens.odor, levels = c("Odor", "Odorless"))
+#generate confusion matrix to extract # misclassified
+confusionMatrix(test$boelens.odor, test$odor.class)
+#calculate SE - inputs are # minor class, # major class, # misclassified
+Boelens.SE <- AUROC.CI(10, 20, 8) #0.09247919
+
+
+#Fragrance-like performance on validate set ----
+
+#set default to Odorless
+test$fragrancelike.odor <- 1 #"Odorless"
+#assign class "Odor" if molecule meets Fragrance-like criteria from Ruddigkeit et al 2014
+test[test$nSK < 22 & 
+           test$nN == 0 &
+           test$nP == 0 &
+           test$nF == 0 &
+           test$nCL == 0 &
+           test$nBR == 0 &
+           test$nI == 0 &
+           test$nB == 0 &
+           test$nO + test$nS < 4 &
+           test$nHDon <2, "fragrancelike.odor"] <- 0 #"Odor"
+
+#compare fragrance-like odor class prediction to true class
+test.FL.pred <- prediction(test$fragrancelike.odor, test$odor.class)
+#calculate auroc
+test.FL.perf <- performance(test.FL.pred, "auc") #AUROC = 0.8888889
+#print auroc
+test.FL.perf@y.values[[1]] #AUROC = 0.975
+
+#change to factor for confusionMatrix calculation
+test$fragrancelike.odor <- ifelse(test$fragrancelike.odor==1, "Odorless", "Odor")
+test$fragrancelike.odor <- factor(test$fragrancelike.odor, levels = c("Odor", "Odorless"))
+#generate confusion matrix to extract # misclassified
+confusionMatrix(test$fragrancelike.odor, test$odor.class)
+#calculate SE - inputs are # minor class, # major class, # misclassified
+FL.SE <- AUROC.CI(10, 20, 1) #0.02878352
+
+
+#Many feature ML performance on validation set ----
+
+#generate ML predictions on validation set molecules
+ML.test.prob <- predict(xgbL.manyfeature, newdata = test_scaled, type = "prob")[,1]
+#ML.prob <- predict(xgbL.manyfeature, newdata = ALL_scaled, type = "prob")[,1]
+#saveRDS(ML.prob, "Data/Processed/ML.prob.rds") #for supp tables
+
+#compare many feature ML odor class probabilities to true class
+ML.test.pred <- prediction(ML.test.prob, test$odor.class)
+#calculate auroc
+ML.test.perf <- performance(ML.test.pred, "auc") 
+#print auroc
+ML.test.perf@y.values[[1]] #AUROC = 0.975
+
+#generate raw odor/odorless classifications (instead of probabilities)
+ML.test.raw <- predict(xgbL.manyfeature, newdata = test_scaled, type = "raw")
+#generate confusion matrix to extract # misclassified
+confusionMatrix(ML.test.raw, test_scaled$odor.class)
+#calculate SE - inputs are # minor class, # major class, # misclassified
+ML.SE <- AUROC.CI(10, 20, 2) #0.04104736
+
+
+#Transport feature ML performance on validation set ----
+
+#generate ML transport predictions on validation set molecules
+test.prob <- predict(xgbL.transport, newdata = test_scaled, type = "prob")[,1] 
+#compare transport ML odor class probabilities to true class
+test.pred <- prediction(test.prob, test_scaled$odor.class)
+#calculate auroc
+test.perf <- performance(test.pred, "auc") 
+#print auroc
+test.perf@y.values[[1]] #AUROC = 0.97
+
+#generate raw odor/odorless classifications (instead of probabilities)
+test.raw <- predict(xgbL.transport, newdata = test_scaled, type = "raw")
+#generate confusion matrix to extract # misclassified
+confusionMatrix(test.raw, test_scaled$odor.class)
+#calculate SE - inputs are # minor class, # major class, # misclassified
+tML.SE <- AUROC.CI(10, 20, 3) #0.05082656
+
+
+#Validation set metrics ----
+AUROCcomp <- data.frame(Model = c("Boelens", "Fragrance-Like", "Transport ML", "Many-Feature ML"),
+                        AUROC = c(test.boelens.perf@y.values[[1]], test.FL.perf@y.values[[1]], test.perf@y.values[[1]], ML.test.perf@y.values[[1]]),
+                        SE = c(Boelens.SE, FL.SE, tML.SE, ML.SE)) %>%
+  mutate(SE.upper = ifelse(AUROC + SE < 1, SE, 1 - AUROC))
+```
+
+```{r, warning=F}
+#horizontal barplot of AUROC values
+ggplot(AUROCcomp, aes(Model, AUROC, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar( aes(ymin=AUROC - SE, ymax = AUROC + SE.upper), width=0.25)+
+  theme_classic() +
+  xlab("") +
+  ylab("AUROC") +
+  coord_flip(ylim=c(0.5,1.0), expand = F)+
+  scale_fill_brewer(type = "qual", palette=2)+
+  #scale_fill_manual(values = c("#ff7f00", "#ffff33", "#984ea3", "#4daf4a"))+
+  theme(axis.text.x = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9),
+        legend.position="none")
+
+#ggsave("figures/final/Fig1C.png", width = 4, height = 1.6)
+#ggsave("figures/final/Fig1C.pdf", width = 4, height = 1.8)
+```
+
+
+
+### Figure 1D
+
+Density of odorous and odorless molecules in transport space defined by molecular weight and number of heteroatoms. Each successive contour line indicates a step increase in density (red = 0.05%, blue = 0.015%). Molecules have a discrete number of heteroatoms, but are jittered along the y-axis to better show density. Plotted within the black box, molecules that obey the “rule of three” with fewer than 3 heteroatoms and molecular weight between 30 and 300 g/mol are generally odorous. 
+
+```{r, results='hide'}
+#######################################-
+#Figure 1D: Rule of Three figure ------
+#######################################-
+
+#print ratio of odorous:odorless molecules in dataset
+table(S1$odor.class) #1618 odor, 309 odorless
+
+#finding the best easy filter
+S1 %>%
+  filter(MW > 30 & MW < 300) %>%
+  filter(nHet <3)%>%
+  select(odor.class) %>%
+  table()
+
+#RULE OF 3: 30 < MW < 300 & nHet <3
+#1094 odor, 49 odorless
+1094/(1094+49) #95.7% odors
+1094/1618 #captures 67.6% of odors = sensitivity
+(309-49)/309 #excludes 84.1% odorless molecules = specificity
+(1094/(1618-1094))/(49/(309-49)) #odds ratio = odds pass filter is odor/odds pass filter if not = 11.1
+```
+
+```{r, warning=F}
+#density map
+ggplot(S1) + 
+  geom_jitter( aes(x=MW, y=nHet, color=odor.class), alpha = 0.1, size=2)+
+  scale_colour_brewer(type="qual", palette = 6, direction = -1) +
+  geom_density_2d(data = S1[S1$odor.class == "Odor",], aes(x=MW, y=nHet), color = "#e41a1c") + 
+  geom_density_2d(data = S1[S1$odor.class == "Odorless",], aes(x=MW, y=nHet), color = "#377eb8") + 
+  xlab("Molecular Weight (g/mol)") + ylab("Number of Heteratoms") + 
+  scale_x_continuous(limits = c(0,500),expand = c(0.01, 0.01), breaks = c(0, 30, 100, 200, 300, 400, 500))+
+  scale_y_continuous(limits = c(-0.5,12),expand = c(0.01, 0.01))+
+  geom_segment(aes(x=30, y=2.5, xend=300, yend=2.5), color = "black", size=0.3)+
+  geom_segment(aes(x=30, y=-0.5, xend=30, yend=2.5), color = "black", size=0.3)+
+  geom_segment(aes(x=300, y=-0.5, xend=300, yend=2.5), color = "black", size=0.3)+
+  geom_segment(aes(x=30, y=-0.5, xend=300, yend=-0.5), color = "black", size=0.3)+
+  #geom_text( aes(x = 180, y = -0.1, label = "96% odorous"), color = "black", size = 3)+
+  labs(color = "Odor Class")  +
+  theme_classic() +
+  theme(axis.text.x = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9),
+        legend.text = element_text(size=8),
+        legend.title = element_text(size=9),
+        #legend.position = c(0.2, 0.9))
+        legend.position = "right")
+
+#ggsave("figures/final/Fig1D.png", height = 4.2, width = 4.2)
+#ggsave("figures/final/Fig1D.pdf", height = 2.5, width = 4)
+```
+
+```{r, results='hide'}
+#extract contour densities for Odorless compounds
+gg <- ggplot(S1) + 
+  geom_density_2d(data = S1[S1$odor.class == "Odorless",], aes(x=MW, y=nHet) ) 
+gb <- ggplot_build(gg)
+gbd <- gb$data[[1]]
+unique(gbd$level) #1e-04 2e-04 3e-04 4e-04 5e-04 6e-04 7e-04 8e-04
+
+
+#extract contour densities for Odorous compounds
+gg2 <- ggplot(S1) + 
+    geom_density_2d(data = S1[S1$odor.class == "Odor",], aes(x=MW, y=nHet)) 
+gb <- ggplot_build(gg2) 
+gbd <- gb$data[[1]]
+unique(gbd$level) # = 0.0005 0.0010 0.0015 0.0020 0.0025
+
+```
+
+
+## Figure 2
+
+Fig. 2. Inaccuracies in data impact model performance. 
+
+### Figure 2A
+
+Difference between experimentally determined boiling point (BP) values and BP values calculated using the Burnop (8) and Banks (9) methods. 
+
+```{r, warning=F}
+#######################################-
+#Figure 2A: Compare BP error of Banks and Burnop eqns-----
+#######################################-
+
+#plot error in Burnop and Banks estimates of boiling point compared with experimental values
+S1 %>%
+  filter(nC + nO + nN + nF + nCL + nBR + nI == nSK) %>% #filter to molecules w/i domain of Burnop applicability
+  filter(!is.na(boiling.point.experimental))%>%
+  mutate(Banks = (boiling.point.estimate.Banks - boiling.point.experimental))%>%
+  mutate(Burnop = (boiling.point.estimate.Burnop - boiling.point.experimental))%>%
+  pivot_longer(Banks:Burnop, names_to = "Method", values_to = "BPerror")%>%
+  ggplot( aes(BPerror, color = Method))+
+  geom_density()+
+  xlim(-750,750)+
+  xlab("Boiling Point Error in °C\n(Estimated - Experimental)")+
+  ylab("Relative frequency")+
+  theme_classic()+
+  scale_color_brewer(type="qual", palette = 3)+
+  theme(axis.text.x = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9),
+        legend.title = element_text(size=9))
+
+#ggsave("figures/final/Fig2A.png", width = 3.5, height = 3)
+#ggsave("figures/final/Fig2A.pdf", width = 4, height = 2)
+
+```
+
+
+### Figure 2B
+
+Odor classification predictions by transport-feature ML models using only estimated BP values calculated by the  Burnop method. 
+
+```{r}
+
+#######################################-
+#Figure 2B: Burnop BP Estimate model accuracy-----
+#######################################-
+
+if (file.exists("xgbL.Burnop.rds")){
+  xgbL.Burnop <- readRDS("xgbL.Burnop.rds")
+}else {
+#filter training set
+train_Burnop <- train_smote %>% select(odor.class, boiling.point.estimate.Burnop, MLOGP) %>%
+  filter(! is.na(boiling.point.estimate.Burnop))
+
+#train model
+set.seed(train.seeds[6])
+      xgbL.Burnop <- train(odor.class~., data=train_Burnop, 
+                         method = "xgbLinear", 
+                         trControl = fit.control,
+                         metric = "ROC", 
+                         tuneGrid = xgbTuningGrid, 
+                         na.action = na.roughfix) 
+#save model
+saveRDS(xgbL.Burnop, "xgbL.Burnop.rds")  
+}
+```
+
+```{r, results='hide'}
+
+#view max cross-validation AUROC
+max(xgbL.Burnop$results$ROC) #CV AUROC 0.92
+
+#Burnop BP estimate model predictions
+Burnop.prob <- predict(xgbL.Burnop, newdata = ALL_scaled, type = "prob")[,2] 
+
+#combine predictions with true odor class
+Burnop_predictions <- ALL_scaled %>% 
+  filter(! is.na(boiling.point.estimate.Burnop)) %>%
+  select(odor.class) %>%
+  mutate(p.transport = Burnop.prob)
+```
+
+```{r}
+#Make dotplot + violin of model predictions - Burnop edition
+ggplot(Burnop_predictions, aes(odor.class, p.transport, color = odor.class)) +
+  geom_jitter(alpha=0.25) +
+  geom_violin(color = "black", alpha = 0.1, scale = "width")+
+  coord_flip()+
+  theme_classic()+
+  labs(x = "True Odor Classification",
+       y = "Predicted Odorous Probability using Burnop-Estimated BP")+
+  scale_color_brewer(type = "qual", palette = 6, direction = -1)+
+  theme(axis.text.x = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position="none")
+
+#ggsave("figures/final/Fig2B.png", width = 4, height = 2)
+#ggsave("figures/final/Fig2B.pdf", width = 4, height = 1.8)
+```
+
+
+### Figure 2C
+
+Odor classification predictions by transport-feature ML models using only estimated BP values calculated by the Banks method.
+
+```{r}
+#######################################-
+#Figure 2C: Banks BP Estimate model accuracy-----
+#######################################-
+
+if (file.exists("xgbL.Banks.rds")){
+  xgbL.Banks <- readRDS("xgbL.Banks.rds")
+}else {
+#filter training set
+train_Banks <- train_smote %>% select(odor.class, boiling.point.estimate.Banks, MLOGP) %>%
+  filter(! is.na(boiling.point.estimate.Banks))
+
+
+S1 %>% filter(is.na(boiling.point.estimate.Banks)) %>% nrow()
+
+#train model
+set.seed(train.seeds[6])
+      xgbL.Banks <- train(odor.class~., data=train_Banks, 
+                         method = "xgbLinear", 
+                         trControl = fit.control,
+                         metric = "ROC", 
+                         tuneGrid = xgbTuningGrid, 
+                         na.action = na.roughfix) 
+#save model
+saveRDS(xgbL.Banks, "xgbL.Banks.rds")
+}
+```
+
+```{r, results='hide'}
+
+#view max cross-validation AUROC
+max(xgbL.Banks$results$ROC)  #CV AUROC 0.94
+
+#Banks BP estimate model predictions
+Banks.prob <- predict(xgbL.Banks, newdata = ALL_scaled, type = "prob")[,2] 
+
+#combine predictions with true odor class
+Banks_predictions <- ALL_scaled %>% 
+  filter(! is.na(boiling.point.estimate.Banks)) %>%
+  select(odor.class) %>%
+  mutate(p.transport = Banks.prob)
+```
+
+```{r}
+#Make dotplot + violin of model predictions
+ggplot(Banks_predictions, aes(odor.class, p.transport, color = odor.class)) +
+  geom_jitter(alpha=0.25) +
+  geom_violin(color = "black", alpha = 0.1, scale = "width")+
+  coord_flip()+
+  theme_classic()+
+  labs(x = "True Odor Classification",
+       y = "Predicted Odorous Probability using Banks-Estimated BP")+
+  scale_color_brewer(type = "qual", palette = 6, direction = -1)+
+  theme(axis.text.x = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position="none")
+
+#ggsave("figures/final/Fig2C.png", width =4, height = 2)
+#ggsave("figures/final/Fig2C.pdf", width =4, height = 1.8)
+```
+
+
+### Figure 2D
+
+Human subject-classified molecules in transport space defined by BP and log P. Many clearly non-volatile molecules were initially classified as odors due to odorous contaminants.
+
+```{r, results='hide'}
+#######################################-
+#Figure 2D: Reclassified molecules in transport feature space-----
+#######################################-
+
+#what percent of lab-tested molecules initially classified as Odorous were reclassified through QC process?
+nrow(S2[S2$initial.odor.class == "Odor",]) #111 Odors initially
+nrow(S2[S2$QC.reclassified == "yes",]) #24 reclassified
+nrow(S2[S2$QC.reclassified == "yes",])*100/nrow(S2[S2$initial.odor.class == "Odor",]) #21.6% reclassified
+
+#create small df with lab-tested molecules, reclassification info - PLOT 3 CATEGORIES
+reclass <- S1 %>%
+  filter(odor.class.source == "Lab-Tested") %>%
+  left_join(S2, by = "SMILES") %>%
+  select(compound.name, odor.class, QC.reclassified, boiling.point.best.available, MLOGP, nHet) %>%
+  mutate(odor.class = as.character(odor.class))%>%
+  mutate(odor.3class = ifelse(QC.reclassified == "yes", "Odorless with odorous contaminants", odor.class)) %>%
+  mutate(BP.K = boiling.point.best.available + 273.15) 
+```
+
+```{r}
+#plot molecules, showing reclassified molecules, in transport space 
+ggplot(reclass, aes(x=boiling.point.best.available, y=MLOGP, color=odor.3class, shape=odor.3class)) + 
+  geom_jitter(alpha = 0.75) +
+  theme_classic() +
+  scale_color_manual(values = c("#e41a1c", "#377eb8", "black"))+
+  scale_shape_manual(values = c(16, 16, 4))+
+  #scale_x_log10()+
+  theme(legend.position = "top",
+        axis.text.x = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_text(size = 9), 
+        axis.title.y = element_text(size = 9),
+        legend.text = element_text(size = 8),
+        legend.title = element_text(size = 9),
+        legend.key.width = unit(0.05, "in")) +
+  xlab("Boiling Point (°C)") + 
+  #ylab("Number of Heteratoms") + 
+  ylab("Log P") + 
+  labs(color = "Class", shape = "Class")   
+
+
+#ggsave("figures/final/Fig2D.png", height = 3, width = 4)
+#ggsave("figures/final/Fig2D.pdf", height = 3, width = 4)
+```
+
+
+### Figure 2E
+
+Transport-feature ML model odor predictions for human subject-classified molecules. Chemical compounds that are odorless but had odorous contaminants are correctly predicted to be odorless by the model. 
+ 
+```{r}
+#######################################-
+#Figure 2E: Validation set predictions - models catch misclassifications-----
+#######################################-
+
+#generate predictions for transport ML model on full dataset 
+prob.transport <- predict(xgbL.transport, newdata = ALL_scaled, type = "prob")[,2]
+
+#combine predictions with descriptive data
+LabTest_predictions <- ALL_scaled %>% 
+  mutate(p.transport = prob.transport) %>%
+  right_join(S2, by = "SMILES") %>%
+  select(1:3, QC.reclassified, p.transport) %>%
+  mutate(odor.class = as.character(odor.class))%>%
+  mutate(odor.3class = ifelse(QC.reclassified == "yes", "Odorless with odorous contaminants", odor.class))
+  
+#Make dotplot of model predictions, showing reclassified molecules
+ggplot(LabTest_predictions, aes(odor.3class, p.transport, color = odor.3class, shape = odor.3class)) +
+  geom_jitter(alpha=0.75) +
+  coord_flip()+
+  theme_classic()+
+  labs(x = "True Odor Classification",
+       y = "Transport ML Model Predicted Odorous Probability")+
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10))+
+  scale_color_manual(values = c("#e41a1c", "#377eb8", "black"))+
+  scale_shape_manual(values = c(16, 16, 4))+
+  theme(axis.text.x = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position="none")
+
+#ggsave("figures/final/Fig2E.png", width = 4, height = 2.6)
+#ggsave("figures/final/Fig2E.pdf", width = 4, height = 2.6)
+```
+
+```{r, results='hide'}
+#######################################-
+#Figure 2 Associated Stats ------
+#######################################-
+
+#compare transport ML CV AUROC
+max(xgbL.transport$results$ROC) # CV AUROC 0.99
+
+#summary stats of boiling point error
+S1 %>%
+  filter(!is.na(boiling.point.experimental))%>%
+  mutate(Banks = abs(boiling.point.experimental - boiling.point.estimate.Banks))%>%
+  mutate(Burnop = abs(boiling.point.experimental - boiling.point.estimate.Burnop))%>%
+  pivot_longer(Banks:Burnop, names_to = "Method", values_to = "BPerror")%>%
+  group_by(Method)%>%
+  summarize(med = median(BPerror, na.rm = T), 
+            max = max(BPerror, na.rm = T),
+            min = min(BPerror, na.rm = T))
+
+#error rates  of models trained/tested on estimated bp
+#banks boiling point error rate
+Banks_predictions %>%
+  filter(odor.class == "Odor" & p.transport < 0.5 |
+           odor.class == "Odorless" & p.transport > 0.5) %>%
+  nrow() #107 errors 
+107/nrow(Banks_predictions) # 5.6% error rate
+
+#burnop boiling point error rate
+Burnop_predictions %>%
+  filter(odor.class == "Odor" & p.transport < 0.5 |
+           odor.class == "Odorless" & p.transport > 0.5) %>%
+  nrow() #95 errors 
+95/nrow(Burnop_predictions) # 5.8% error rate
+
+#compare to error rate using best available boiling point value
+predictions %>%
+  filter(odor.class == "Odor" & p.transport < 0.5 |
+           odor.class == "Odorless" & p.transport > 0.5) %>%
+  nrow() #48 errors 
+47/nrow(predictions) # 2.5% error rate
+
+### AUROC on original classifications (pre-GC QC)
+
+#add original odor class to test set
+test_scaled_initialClass <- test_scaled %>%
+  left_join(S2, by = "SMILES") %>%
+  select(initial.odor.class, boiling.point.best.available, vapor.pressure.best.available, MLOGP)
+
+#generate ML transport predictions on test set molecules
+test.prob.i <- predict(xgbL.transport, newdata = test_scaled_initialClass, type = "prob")[,1] 
+#compare transport ML odor class probabilities to true class
+test.pred.i <- prediction(test.prob.i, test_scaled_initialClass$initial.odor.class)
+#calculate auroc
+test.perf.i <- performance(test.pred.i, "auc") 
+#print auroc
+test.perf.i@y.values[[1]] #AUROC = 0.75
+
+```
+
+
+## Figure 3
+
+Fig. 3. The transport model can be used to predict the population of odor space and identify its understudied regions.
+
+### Figure 3A
+
+Proportion of molecules predicted by transport ML model to be odorous as a function of heavy atom count (HAC). Red circles show the mean probability generated for HAC tranches from the GDB database (12) with standard error bars; hollow circles show the projected odorous probability generated by the logistic regression fit plotted in black. 
+
+```{r}
+### Apply transport model to generate predictions for GDB molecules
+
+#apply model to generate probabilities - using Banks estimate because no experimental values are available
+S3$odor.probability <- predict(xgbL.Banks, newdata = S3, type = "prob")[,2]
+
+#number of possible molecules in GDB-17 per HAC
+GDB.count <- c(3,6,14,47,219,1091,6029,37435,243233,1670163,12219460,72051665,836687200,
+                  2921398415,15084103347,38033661355,109481780580)
+
+#how many odorous molecules? sum odorous probabilities
+GDBprob.byHAC <- S3 %>%
+  group_by(HAC)%>%
+  summarize(meanProb = mean(odor.probability)) %>%
+  mutate(possible.molecules = GDB.count) %>%
+  mutate(Odors = meanProb*possible.molecules)
+
+```
+
+```{r, results='hide'}
+#generate random binarizations from predicted odorous probabilities
+set.seed(111)
+for(i in 1:nrow(S3)){
+  S3$Trial1[i] <- rbinom(1,1,S3$odor.probability[i])
+  S3$Trial2[i] <- rbinom(1,1,S3$odor.probability[i])
+  S3$Trial3[i] <- rbinom(1,1,S3$odor.probability[i])
+  S3$Trial4[i] <- rbinom(1,1,S3$odor.probability[i])
+  S3$Trial5[i] <- rbinom(1,1,S3$odor.probability[i])
+  S3$Trial6[i] <- rbinom(1,1,S3$odor.probability[i])
+  S3$Trial7[i] <- rbinom(1,1,S3$odor.probability[i])
+  S3$Trial8[i] <- rbinom(1,1,S3$odor.probability[i])
+  S3$Trial9[i] <- rbinom(1,1,S3$odor.probability[i])
+  S3$Trial10[i] <- rbinom(1,1,S3$odor.probability[i])
+}
+#how variable are the trials?
+S3 %>%
+  select(Trial1:Trial10)%>%
+  colSums() #not very variable
+
+#use data from all 10 simulations
+S3.long <- S3 %>%
+  pivot_longer(Trial1:Trial10, names_to = "TrialNo", values_to = "Class")
+
+#apply glm-binomial to binomial data for 10 simulations
+t1 <- glm(Class ~ HAC, data = S3.long, family = "binomial")
+summary(t1)
+eq.p <- function (x) {exp(-0.3239870*x + 3.7563301)/(1 + exp(-0.3239870*x + 3.7563301))} #need to manually update from summary(t1)
+
+#test predicted % odorous for HAC 18-21 -> 4.5% for HAC 21
+eq.p(21)
+
+#extend to HAC 21
+HAC21 <- tibble(HAC = 18:21,
+                Prob.Odor = eq.p(18:21))
+
+#calculate variance
+S3 <- S3 %>%
+  mutate(Variance = odor.probability*(1-odor.probability))
+sum(S3$Variance) #11,874.18 
+```
+
+
+```{r, warning=F}
+#######################################-
+#Figure 3A: Enumerating odor space-Percent Odorous -----
+#######################################-
+
+### Make odor probability by HAC plot
+plot1 <- S3 %>%
+  group_by(HAC) %>%
+  mutate(count = n()) %>%
+  summarize(Prob.Odor = mean(odor.probability),
+            SE = sqrt(sum(Variance))/mean(count))  %>%
+  #summarize(Prob.Odor = mean(Class)) %>%
+  ggplot( aes(HAC, Prob.Odor)) + 
+  geom_point(color="#e41a1c", size=2) +
+  geom_point(data=HAC21, aes(HAC, Prob.Odor), shape=21, size=2)+
+  geom_errorbar( aes(ymin = Prob.Odor - SE, ymax = Prob.Odor+ SE))+
+  #geom_violin(aes(group=heavy.atoms)) +
+  #geom_bar(stat = "identity", position = "stack")  + 
+  stat_function(fun=eq.p, xlim = c(3,21)) +
+  #geom_smooth()+
+  #scale_x_continuous(limits = c(0,21), expand = c(0.01, 0.01), breaks = seq(1,21,4)) +
+  scale_x_continuous(limits = c(0.5,21.5), expand = c(0.05, 0.01), breaks = seq(1,21,1)) +
+  scale_y_continuous(limits = c(0,1.0), expand = c(0.02, 0), breaks = seq(0,1.00,0.10)) +
+  #theme_minimal() + 
+  theme_classic()+
+  xlab("Number of Heavy Atoms") + 
+  ylab("Proportion Molecules \n Predicted to be Odorous") +
+  labs(fill = "Prediction") + 
+  theme(plot.title = element_text(hjust = 0.5), 
+        text = element_text(size=8),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank())
+plot1
+```
+
+
+### Figure 3B
+
+Estimated number of possible molecules and predicted odorous molecules from the GDB databases as a function of HAC. Lighter shaded bars indicate HAC values beyond GDB-17; as a conservative estimate, the number of possible molecules with HAC 18-21 was set to equal that of HAC 17. 
+
+```{r}
+#######################################-
+#Figure 3B: Enumerating odor space-Number predicted molecules & odors -----
+#######################################-
+
+#make summary table with predicted # odorous molecules by HAC, use HAC-17 molecule count for HAC 18-21
+GDBTotal.Extrapolate <- tibble(HAC = 1:21,
+                               Source = c(rep("GDB", 17), rep("Curve Fit", 4)),
+                               Molecules = c(3,6,14,47,219,1091,6029,37435,243233,1670163,12219460,72051665,836687200,
+                                             2921398415,15084103347,38033661355, rep(109481780580, 5)),
+                               Prob.Odor = eq.p(1:21),
+                               Predicted.Odor = Molecules*Prob.Odor)
+
+#format df to generate plot
+p <- GDBTotal.Extrapolate %>% gather(key = "type", value = "number", -c(1:2,4)) %>% 
+  mutate(number = number/1E9)%>%
+  mutate(type = factor(type, levels = c("Molecules", "Predicted.Odor"))) 
+p$type <- gsub("Predicted.Odor", "Odorous Molecules", p$type)
+
+#plot bar graph of # molecules and predicted # odorous molecules as a function of HAC
+plot2 <- ggplot() + 
+  geom_bar(data=subset(p, HAC<18), aes(HAC, number, fill=type, color=type), stat = "identity", position = "dodge")  + 
+  geom_bar(data=subset(p, HAC>17), aes(HAC, number, fill=type), stat = "identity", position = "dodge", alpha = 0.3)  + 
+  scale_x_continuous(limits = c(0.5,21.5), expand = c(0.05, 0.01), breaks = seq(1,21,1)) +
+  theme_classic() + 
+  scale_fill_brewer(name = "Prediction", 
+                    labels = c("Molecules", "Odorous Molecules"),
+                    type="qual", palette = 6, direction = -1) + 
+  scale_color_brewer(name = "Prediction", 
+                     labels = c("Molecules", "Odorous Molecules"),
+                     type="qual", palette = 6, direction = -1) + 
+  xlab("Number of Heavy Atoms") + 
+  ylab("Predicted Molecules \n and Odors (Billions)") +
+  #labs(fill = "Prediction") + 
+  scale_y_continuous(limits = c(0,120),
+                     breaks = c(0, 20, 40, 60, 80, 100, 120),
+                     expand = c(0, 0)) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        text = element_text(size=8),
+        legend.position = c(0.2, 0.8), 
+        axis.line.x = element_blank())
+plot2
+```
+
+
+### Figure 3C
+
+Cumulative estimates of possible molecules and odorous molecules with increasing HAC on a logarithmic scale. The red datapoint at HAC 17 reflects our conservative estimate of 33 billion odorous molecules; the light red datapoint at HAC 21 reflects our less-conservative estimate of 62 billion odorous molecules.
+
+```{r}
+#######################################-
+#Figure 3C: Enumerating odor space-Cumumulative predicted molecules & odors -----
+#######################################-
+
+#calculate cumulative molecules and predicted odorous molecules as a function of HAC 
+p2 <- GDBTotal.Extrapolate %>%
+  mutate(Cumulative.Molecules = cumsum(Molecules),
+         Cumulative.Odors = cumsum(Predicted.Odor)) %>%
+  gather(key = "type", value = "number", 6:7) %>%
+  mutate(type = factor(type, levels = c("Molecules", "Odorous Molecules"))) 
+p2$type <- gsub("Cumulative.Molecules", "Molecules", p$type)
+p2$type <- gsub("Cumulative.Odors", "Odorous Molecules", p$type)
+
+#plot cumulative molecules and odorous molecules by HAC on a log scale
+plot3 <- ggplot()+
+  geom_point(data=subset(p2, HAC<18), aes(HAC, number, color=type), size=2)  + 
+  geom_point(data=subset(p2, HAC>17), aes(HAC, number, color=type), size=2, alpha = 0.3)  + 
+  scale_x_continuous(limits = c(1,21.5), expand = c(0.05, 0.1), breaks = seq(1,21,1)) +
+  theme_classic() + 
+  scale_color_brewer(type="qual", palette = 6, direction = -1) + 
+  xlab("Number of Heavy Atoms") + 
+  ylab("Cumulative Predicted Molecules \n and Odors (log scale)") +
+  labs(color = "Prediction") + 
+  scale_y_log10(limits=c(1E0, 1E14),
+                breaks = scales::trans_breaks("log10", function(x) 10^x),
+                labels = scales::trans_format("log10", scales::math_format(10^.x)),
+                expand = c(0, 0)) +
+  theme(plot.title = element_text(hjust = 0.5), 
+        text = element_text(size=8),
+        legend.position = c(0.2, 0.8))
+
+plot3
+```
+
+```{r}
+### print odor space enumeration estimates
+
+#how many odorous molecules? sum odorous probabilities for GDB-17
+paste0("A conservative estimate of the number of odorous molecules with 17 or fewer heavy atoms is ", round(sum(GDBprob.byHAC$Odors),0))
+
+#new extrapolated estimate for HAC < 22
+paste0("A conservative estimate of the number of odorous molecules with 21 or fewer heavy atoms is ", round(sum(GDBTotal.Extrapolate$Predicted.Odor),0))
+```
+
+
+```{r, eval=F}
+#combine figure 3 plots on shared x axis
+cowplot::plot_grid(plot1, plot2, plot3, align = "v", ncol = 1, rel_heights = c(0.35, 0.3, 0.35))
+
+#ggsave("figures/final/Fig4ABC.png", height = 6, width = 4)
+#ggsave("figures/final/Fig3.pdf", height = 6, width = 4)
+
+```
+
