@@ -1,2 +1,2 @@
 # OlfactorySpace
-Coming Soon: This repository will house data and code used to build odorous/odorless classification models, draw borders of olfactory space, and estimate the number of possible odorants.
+This repository, associated with the manuscript Drawing the Borders of Olfactory Space (https://doi.org/10.1101/2020.12.04.412254), houses code used to conduct all analyses and generate figures included in the manuscript. This code builds odorous/odorless classification models, draws borders of olfactory space, and estimates the number of possible odorants. Raw data will be uploaded at a later date.
